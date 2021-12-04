@@ -13,6 +13,13 @@
 // 6 = 120A
 
 
+int yCenter = 127;
+int zCenter = 127;
+float yOffset = 20; //ADC
+float zOffset = 14; //ADC
+float xOffset = 0; //ADC
+
+
 int incomingByte = 0;
 uint64_t lastRXTimeStamp = 0;
 uint32_t lastRXTimer = 0;
@@ -194,8 +201,8 @@ void updateMotion() {
   }
   
   // int mB = 127 - z;
-  int motorA = 127 - y;
-  int motorB = 127 - z;
+  int motorA = yCenter - y;
+  int motorB = zCenter - z;
   
 
   if (lastInterlockStatus == true) {
@@ -216,20 +223,22 @@ void updateMotion() {
   Serial.print(",");
   Serial.println(z);
 
-  if (motorA > 20 || motorA <  -20) {         
+  //Deadband
+  if (motorA > 15 || motorA < -15) {         
     setMotor(0, motorA);        
   } else {    
     setMotor(0, 0); //Stop Traction    
   }
 
-  if (motorB > 10 || motorB <  -10) {         
-    int attenuatedMotorB = map(motorB, -127, 127, -60, 60);
+  if (motorB > 3 || motorB < -3) {         
+    if (motorB > 127) { motorB = 127; }
+    if (motorB < -127) { motorB = -127; }    
+
+    int attenuatedMotorB = (int)map(motorB, (0 - zCenter), zCenter, -60, 60);    
     setMotor(1, attenuatedMotorB);       
   } else {    
     setMotor(1, 0); //Stop Steering    
   }
-
-  //Map Steering Gain!
    
 }
 
@@ -308,9 +317,9 @@ void serialPassThru() {
 
 void parseData() {
   //(127/3.3) * 3.3
-  float scaledX = 254 / 3.3 * remoteData.x;
-  float scaledY = 254 / 3.3 * remoteData.y;
-  float scaledZ = 254 / 3.3 * remoteData.z; 
+  float scaledX = (254.0 + xOffset) / 3.3 * remoteData.x;
+  float scaledY = (254.0 + yOffset) / 3.3 * remoteData.y; //20
+  float scaledZ = (254.0 + zOffset) / 3.3 * remoteData.z;  //14
   x = int(scaledX);
   y = int(scaledY);
   z = int(scaledZ);
