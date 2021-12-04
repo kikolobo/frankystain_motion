@@ -219,10 +219,18 @@ void updateMotion() {
   if (motorA > 20 || motorA <  -20) {         
     setMotor(0, motorA);        
   } else {    
-    setMotor(0, 0); //Stop All    
+    setMotor(0, 0); //Stop Traction    
   }
 
-  setMotor(1, motorB);  
+  if (motorB > 10 || motorB <  -10) {         
+    int attenuatedMotorB = map(motorB, -127, 127, -60, 60);
+    setMotor(1, attenuatedMotorB);       
+  } else {    
+    setMotor(1, 0); //Stop Steering    
+  }
+
+  //Map Steering Gain!
+   
 }
 
 String decToHex(int decimal) {
