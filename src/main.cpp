@@ -1,17 +1,28 @@
+#include <SPI.h>
 #include <Arduino.h>
-#include <esp_now.h>
 #include <Adafruit_NeoPixel.h>
-#include <WiFi.h>
-// MY address: C4:DD:57:67:31:D0
-// ^02 Amp Limit
-// 0 = 30A
-// 1 = 45A
-// 2 = 60A
-// 3 = 75A
-// 4 = 90A
-// 5 = 105A (default) 
-// 6 = 120A
+#include <FastLED.h>
+#include <FastLED_RGBW.h>
+#include <LoRa.h>
+#include <vector>
+#include <FlexCAN_T4.h>
+#include <isotp.h>
 
+isotp<RX_BANKS_16, 512> tp; /* 16 slots for multi-ID support, at 512bytes buffer each payload rebuild */
+FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
+
+
+#define NUM_LEDS 7
+#define DATA_PIN 3
+
+const long frequency = 915E6;
+const int LORA_CS = 10;
+const int LORA_RS = 6;
+const int LORA_RXEN = 2;
+const int LORA_TXEN = 9;
+const int LORA_ISR = A7;
+
+const uint16_t MIN_DISTANCE_STOP = 150;
 
 int yCenter = 127;
 int zCenter = 127;
@@ -26,35 +37,45 @@ uint32_t lastRXTimer = 0;
 bool newRemoteDataAvailable = false;
 bool lastInterlockStatus = false;
 
+String debug;
+
 uint32_t lastBeaconEvent = 0;
 uint32_t beaconStrobeSpeed = 500;
 
 
+CRGBW leds[NUM_LEDS];
+CRGB *ledsRGB = (CRGB *) &leds[0];
 
-static uint8_t BTN_OB_PIN = 0;
-Adafruit_NeoPixel beacon(7, 27, NEO_GRBW + NEO_KHZ800);
-Adafruit_NeoPixel obled(1, 2, NEO_GRB + NEO_KHZ800);
+int x;
+int y;
+int z;
+bool b1;
+bool b2;
+bool b3;
+bool bj;
+
+bool bj_last;
 
 typedef struct bcast_message {  
   float x;
   float y;
   float z;  
-  bool b1;
-  bool b2;
-  bool b3;
-  bool bj;  
+  bool b1 = false;
+  bool b2 = false;
+  bool b3 = false;
+  bool bj = false;
 } bcast_message;
 
 typedef struct button_state {    
-  bool state;
-  bool didUpdate;  
+  bool state = false;
+  bool didUpdate = false;  
 } button_state;
 
 typedef struct remote_button_state {    
   button_state b1;
   button_state b2;
   button_state b3;
-  button_state bj;    
+  button_state bj;   
 } remote_button_state;
 
 enum BeaconMode {
@@ -65,77 +86,196 @@ enum BeaconMode {
   interlock
 };
 
-
-int x;
-int y;
-int z;
-bool b1;
-bool b2;
-bool b3;
-bool bj;
-
 bcast_message remoteData;
 remote_button_state remoteButtonState;
 bool beaconState = false;
 
-BeaconMode beaconMode = BeaconMode::off;
+volatile BeaconMode beaconMode = BeaconMode::off;
 
 void enterSerialMode();
 void serialPassThru();
 void checkWatchDog();
 void setMotor(int channel, int speed);
 void stopAll();
-void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len);
 void parseData();
-void updateRunMode();
 void updateMotion();
 void updateRemoteButtonState();
 void updateBeacon();
 void beaconEvent();
 void setBeacon(BeaconMode newMode);
+void transmitStatus();
+void canBusCallback(const ISOTP_data &config, const uint8_t *buf);
+void checkTimeOut();
 
-
+void onReceive(int packetSize);
 String decToHex(int decimal);
+
 
 void setup() {
   Serial.begin(115200);
-  Serial1.begin(9600, SERIAL_7E1, 19, 23);
-  WiFi.mode(WIFI_STA);  
-
-  pinMode(BTN_OB_PIN, INPUT);
-  
-  
-
-  Serial.println("FrankyStain 0.1 [BOOT]]\n");
-  Serial.println("MacAddress: " + WiFi.macAddress());
-
+  Serial4.begin(9600, SERIAL_7E1);  
+  pinMode(LORA_ISR, INPUT);
+  pinMode(LORA_TXEN, OUTPUT);
+  pinMode(LORA_RXEN, OUTPUT);
+  pinMode(3, OUTPUT);    
+  Serial.println("FrankyStain 0.2 Teensy [BOOT]\n");  
   delay(500);  
-   
-//  FastLED.addLeds<WS2812, 27, GRB>(leds, 7).setCorrection( TypicalLEDStrip );
-  // FastLED.addLeds<SK6812, 2, GRB>(obled, 1);
-  beacon.begin();   
-  obled.begin(); 
-  // FastLED.addLeds<WS2812B, 27, GRB>(beacon, getRGBWsize(7)).setCorrection( TypicalLEDStrip );
   
+  LoRa.setPins(LORA_CS, -2, LORA_ISR);
 
-
-
-
-
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("Error: ESPNOW Failed");        
+  if (!LoRa.begin(915E6)) {             // initialize ratio at 915 MHz
+    Serial.println("[SETUP] Radio Failed");
+    while (true);                       // if failed, do nothing
   }
- 
+
+
+  //FastLED with RGBW
+  FastLED.addLeds<WS2812B, DATA_PIN, RGB>(ledsRGB, getRGBWsize(NUM_LEDS));  
+
+    //CAN
+  Can1.begin();
+  Can1.setClock(CLK_60MHz);
+  Can1.setBaudRate(95238);
+  Can1.setMaxMB(16);
+  Can1.enableFIFO();
+  Can1.enableFIFOInterrupt();
+  tp.begin();
+  tp.setWriteBus(&Can1); 
+  tp.onReceive(canBusCallback);
+
+
   enterSerialMode();
-  esp_now_register_recv_cb(OnDataRecv);  
+  Serial.println("[Entering Loop]");  
+  digitalWrite(LORA_RXEN, HIGH);
+  lastRXTimeStamp = millis();
+  setBeacon(BeaconMode::standby);
+}
+
+
+
+
+
+void loop() {
+    
+  onReceive(LoRa.parsePacket());  
+  checkTimeOut();
+  updateMotion();      
+  updateBeacon(); 
   
 }
 
-void loop() {
-  updateMotion();  
+std::vector<String> split(String str, String token) {
+    std::vector<String> fields;
+
+    String field;
+    for (uint16_t i = 0; i < str.length()+1; i++) {
+      String character = str.substring(i,i+1);      
+      if (character == token || i == str.length()) {
+        fields.push_back(field);
+        field = "";
+      } else {
+        field = field + character;
+      }
+      
+    }
+    return fields;
+}
+
+
+void onReceive(int packetSize) {
+
+  if (packetSize <=0 ) { return; }
+
+  lastRXTimeStamp = millis(); 
+  
+  if (LoRa.available()) {
+    String inString = "";
+    while(LoRa.available()) {
+       inString += (char)LoRa.read();
+    }
+    
+    std::vector<String> lengthFields = split(inString,"-");
+    uint16_t rxLength = lengthFields.back().toInt();
+    std::vector<String> fields = split(lengthFields.front(),",");
+
+
+    if (rxLength+2!=(uint16_t)inString.length()) {
+      Serial.println("[onReceive] Invalid Data Received:");
+      Serial.println(inString);
+      return;
+    }
+
+    if (fields.size() != 4) {
+      Serial.println("[onReceive] Invalid Data Received [Fields]:");
+      Serial.println(inString);
+      return;
+    }
+    
+    remoteData.x = fields[0].toFloat();
+    remoteData.y = fields[1].toFloat();
+    remoteData.z = fields[2].toFloat();
+
+    remoteData.b1 = (bool)fields[3].substring(0,1).toInt();
+    remoteData.b2 = (bool)fields[3].substring(1,2).toInt();
+    remoteData.b3 = (bool)fields[3].substring(2,3).toInt();
+    remoteData.bj = (bool)fields[3].substring(3,4).toInt();
+
+    debug = fields[3].substring(0,1);
+
+    parseData();   
+  } 
+
+}
+
+void parseData() {
+  //(127/3.3) * 3.3
+  float scaledX = (254.0 + xOffset) / 3.3 * remoteData.x;
+  float scaledY = (254.0 + yOffset) / 3.3 * remoteData.y; //20
+  float scaledZ = (254.0 + zOffset) / 3.3 * remoteData.z;  //14
+  x = (uint16_t)scaledX;
+  y = (uint16_t)scaledY;
+  z = (uint16_t)scaledZ;
+ 
+
+
+  if (remoteData.b1 != b1) {     
+    remoteButtonState.b1.state = remoteData.b1;
+    remoteButtonState.b1.didUpdate = true;
+  } 
+
+ if (remoteData.b2 != b2) {
+    remoteButtonState.b2.state = b2;
+    remoteButtonState.b2.didUpdate = true;    
+  }
+
+  if (remoteData.b3 != b3) {
+    remoteButtonState.b3.state = b3;
+    remoteButtonState.b3.didUpdate = true;
+  }
+
+  b1 = remoteData.b1;
+  b2 = remoteData.b2;
+  b3 = remoteData.b3;
+  bj = remoteData.bj;  
+
+  newRemoteDataAvailable = true; 
   updateRemoteButtonState();
-  updateRunMode();
-  updateBeacon();
+  transmitStatus();
+}
+
+void transmitStatus() {  
+  
+  //Not Working
+  // if (LoRa.available() > 0) { return; }
+
+  if (LoRa.beginPacket() == true) {   
+    digitalWrite(LORA_RXEN, LOW);
+    digitalWrite(LORA_TXEN, HIGH);                      
+    LoRa.write(beaconMode);        
+    digitalWrite(LORA_RXEN, HIGH);
+    digitalWrite(LORA_TXEN, LOW);         
+    LoRa.endPacket(false);          
+  }
 }
 
 void updateRemoteButtonState() {
@@ -143,6 +283,7 @@ void updateRemoteButtonState() {
 if (remoteButtonState.b1.didUpdate == true) {
   if (remoteButtonState.b1.state == false) {
     Serial.println("RELEASED B1");
+    setBeacon(BeaconMode::standby);
   } else {
     Serial.println("PRESSED B1");
   }
@@ -166,79 +307,90 @@ if (remoteButtonState.b3.didUpdate == true) {
   }
   remoteButtonState.b3.didUpdate = false;
 }
-
-}
-
-void updateRunMode() {
-  bool obbtn_state = digitalRead(BTN_OB_PIN);
-
-  if (obbtn_state == LOW) {
-    Serial.print("Serial PassThru Mode");
-    while(true) {
-      serialPassThru();
-    }
-  }
 }
 
 
-void updateMotion() {
+
+void checkTimeOut() {
   lastRXTimer = millis() - lastRXTimeStamp;
- 
+
   if (lastRXTimer > 300) {
     stopAll();
-    Serial.println("Remote Message Expired. Stop All: " + String(lastRXTimer));        
-    // beaconMode = BeaconMode::interlock;   
+    Serial.println("Remote Message Expired. Stop All: " + String(lastRXTimer));            
     setBeacon(BeaconMode::interlock);
     return;
   }
+}
 
-  if (bj == false) {    
-    stopAll();
-    // beaconMode = BeaconMode::standby;
-    setBeacon(BeaconMode::standby);
-    lastInterlockStatus = true;
+void updateMotion() {  
+ 
+  if (beaconMode == BeaconMode::interlock) {
     return;
   }
-  
-  // int mB = 127 - z;
-  int motorA = yCenter - y;
-  int motorB = zCenter - z;
-  
 
-  if (lastInterlockStatus == true) {
-    if (abs(motorA) > 20) {      
-      // beaconMode = BeaconMode::interlock;
-      setBeacon(BeaconMode::interlock);
-      Serial.println("Motor Power Might JumpStart. Reduce command and try again");
-      return;
+  if (bj == true) {
+    int motorA = yCenter - y;
+      int motorB = zCenter - z;
+
+    if (bj_last == false) {      
+      if (abs(motorA) > 20) {     
+        lastInterlockStatus = true;          
+          Serial.println("Motor Power Might JumpStart. Reduce command and try again");
+          return;
+        }    
+      bj_last = true;
+      
+      setBeacon(BeaconMode::armed);      
     }    
+            
+
+      bool shouldLog = false;
+      if (motorA > 15 || motorA < -15) {         
+        setMotor(0, motorA);  
+        shouldLog = true;             
+      } else {    
+        setMotor(0, 0); //Stop Traction            
+      }
+
+      if (motorB > 3 || motorB < -3) {                 
+        if (motorB > 127) { motorB = 127; }
+        if (motorB < -127) { motorB = -127; }    
+
+        int attenuatedMotorB = (int)map(motorB, (0 - zCenter), zCenter, -60, 60);    
+        setMotor(1, attenuatedMotorB);               
+      } else {    
+        setMotor(1, 0); //Stop Steering    
+      }
+
+      if (z < 89 || z > 140) {
+        shouldLog = true;
+      }
+
+      if (shouldLog == true) {
+        // Serial.print(y); 
+        // Serial.print(",");
+        // Serial.print(z);
+        // Serial.print(",");
+        // Serial.println(lastRXTimer);
+      }
+  } else if (bj_last == true) {
+    stopAll();    
+    bj_last = false;
+    setBeacon(BeaconMode::standby);
   }
 
-  // beaconMode = BeaconMode::armed;
-  setBeacon(BeaconMode::armed);
+  // if (bj == false) {    
+  //   stopAll();    
+  //   setBeacon(BeaconMode::standby);
+  //   lastInterlockStatus = true; 
+  //   return;   
+  // }
   
-  lastInterlockStatus = false; 
+  
 
-  Serial.print(y); //Debug Line
-  Serial.print(",");
-  Serial.println(z);
 
   //Deadband
-  if (motorA > 15 || motorA < -15) {         
-    setMotor(0, motorA);        
-  } else {    
-    setMotor(0, 0); //Stop Traction    
-  }
-
-  if (motorB > 3 || motorB < -3) {         
-    if (motorB > 127) { motorB = 127; }
-    if (motorB < -127) { motorB = -127; }    
-
-    int attenuatedMotorB = (int)map(motorB, (0 - zCenter), zCenter, -60, 60);    
-    setMotor(1, attenuatedMotorB);       
-  } else {    
-    setMotor(1, 0); //Stop Steering    
-  }
+  
    
 }
 
@@ -256,7 +408,14 @@ void stopAll() {
 }
 
 void setMotor(int channel, int speed) {
-
+// // ^02 Amp Limit
+// // 0 = 30A
+// // 1 = 45A
+// // 2 = 60A
+// // 3 = 75A
+// // 4 = 90A
+// // 5 = 105A (default) 
+// // 6 = 120A
   if (speed > 127) { speed = 127; }
   if (speed < -127) { speed = -127; }
 
@@ -281,183 +440,256 @@ void setMotor(int channel, int speed) {
   speed = abs(speed);
 
   motorCmd = motorCmd + decToHex(speed);
-  Serial1.println(motorCmd);
+  Serial4.println(motorCmd);
 }
 
 void checkWatchDog() {
-  if (Serial1.available()) {
-    incomingByte = Serial1.read();    
+  if (Serial4.available()) {
+    incomingByte = Serial4.read();
+    incomingByte = incomingByte & 0x7F;   
+       
     if ((char)incomingByte=='W') {
       Serial.println("Watchdog");
-      Serial1.print((char)13);      
+      Serial4.print((char)13);      
     }
   }    
 }
 
 void enterSerialMode() {
 for (int i = 0; i <= 20; i++) {   
-    Serial1.print((char)13);
+    Serial4.print((char)13);
     delay(30);        
   } 
 }
 
 void serialPassThru() {
+  int incomingByte;
+
+  delay(200);
+  // Serial4.print("!");  
+
    if (Serial.available()) {
-    incomingByte = Serial.read();         
-    Serial1.print((char)incomingByte);              
+    incomingByte = Serial.read(); 
+    // incomingByte = incomingByte;
+    // Serial.print((char)incomingBqwyte);  
+    
+    Serial4.print((char)incomingByte);  
+    
   }
 
- if (Serial1.available()) {
-    incomingByte = Serial1.read();      
-    Serial.print((char)incomingByte);
-    digitalWrite(13, HIGH);    
+ if (Serial4.available()) {
+    incomingByte = Serial4.read();     
+    incomingByte = incomingByte & 0x7F;      
+    Serial.print((char)incomingByte);       
   }
   
 }
 
-void parseData() {
-  //(127/3.3) * 3.3
-  float scaledX = (254.0 + xOffset) / 3.3 * remoteData.x;
-  float scaledY = (254.0 + yOffset) / 3.3 * remoteData.y; //20
-  float scaledZ = (254.0 + zOffset) / 3.3 * remoteData.z;  //14
-  x = int(scaledX);
-  y = int(scaledY);
-  z = int(scaledZ);
-  b1 = remoteData.b1;
-  b2 = remoteData.b2;
-  b3 = remoteData.b3;
-  bj = remoteData.bj;   
-
-  if (remoteButtonState.b1.state != b1) {
-    remoteButtonState.b1.state = b1;
-    remoteButtonState.b1.didUpdate = true;
-  }
-
- if (remoteButtonState.b2.state != b2) {
-    remoteButtonState.b2.state = b2;
-    remoteButtonState.b2.didUpdate = true;
-  }
-
-  if (remoteButtonState.b3.state != b3) {
-    remoteButtonState.b3.state = b3;
-    remoteButtonState.b3.didUpdate = true;
-  }
 
 
-
-  newRemoteDataAvailable = true;       
-}
-
-void OnDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
-  memcpy(&remoteData, incomingData, sizeof(remoteData));
-  lastRXTimeStamp = millis();  
-  parseData();   
-}
-
-
-void beaconEvent() {  
-  
-  if (beaconState==true) {
+void beaconEvent() {    
+  if (beaconState==true) {    
     beaconState = false;
-    beacon.setPixelColor(0, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(1, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(2, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(3, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(4, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(5, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(6, beacon.Color(0, 0, 0, 0));
-    obled.setPixelColor(0, obled.Color(0,0,0));
-    beacon.show();
-    obled.show();
+    leds[0] = CRGB::Black;
+    leds[1] = CRGB::Black;
+    leds[2] = CRGB::Black;
+    leds[3] = CRGB::Black;
+    leds[4] = CRGB::Black;
+    leds[5] = CRGB::Black;
+    leds[6] = CRGB::Black;    
+    FastLED.show();
   } else {
-    beaconState = true;
+    beaconState = true;    
     switch (beaconMode)
     {
     case BeaconMode::off:
       beaconState = false;
-    beacon.setPixelColor(0, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(1, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(2, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(3, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(4, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(5, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(6, beacon.Color(0, 0, 0, 0));
-    obled.setPixelColor(0, obled.Color(0,0,0));
-      beaconStrobeSpeed = 1000;  
+    leds[0] = CRGB::Black;
+    leds[1] = CRGB::Black;
+    leds[2] = CRGB::Black;
+    leds[3] = CRGB::Black;
+    leds[4] = CRGB::Black;
+    leds[5] = CRGB::Black;
+    leds[6] = CRGB::Black;    
+    beaconStrobeSpeed = 1000;  
       break;    
     case BeaconMode::standby:
-    beacon.setPixelColor(0, beacon.Color(0, 255, 0, 0));
-    beacon.setPixelColor(1, beacon.Color(0, 255, 0, 0));
-    beacon.setPixelColor(2, beacon.Color(0, 255, 0, 0));
-    beacon.setPixelColor(3, beacon.Color(0, 255, 0, 0));
-    beacon.setPixelColor(4, beacon.Color(0, 255, 0, 0));
-    beacon.setPixelColor(5, beacon.Color(0, 255, 0, 0));
-    beacon.setPixelColor(6, beacon.Color(0, 255, 0, 0));  
-    obled.setPixelColor(0, obled.Color(0,255,0));
-      beaconStrobeSpeed = 1850;  
+    leds[0] = CRGB::Green;
+    leds[1] = CRGB::Green;
+    leds[2] = CRGB::Green;
+    leds[3] = CRGB::Green;
+    leds[4] = CRGB::Green;
+    leds[5] = CRGB::Green;
+    leds[6] = CRGB::Green;    
+    beaconStrobeSpeed = 1850;  
       break;    
     case BeaconMode::inMotion:
-    beacon.setPixelColor(0, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(1, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(2, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(3, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(4, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(5, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(6, beacon.Color(255, 239, 0, 0));
-    obled.setPixelColor(0, obled.Color(255,239,0));
-      beaconStrobeSpeed = 500;  
+    leds[0] = CRGB::Yellow;
+    leds[1] = CRGB::Yellow;
+    leds[2] = CRGB::Yellow;
+    leds[3] = CRGB::Yellow;
+    leds[4] = CRGB::Yellow;
+    leds[5] = CRGB::Yellow;
+    leds[6] = CRGB::Yellow;    
+      beaconStrobeSpeed = 300;  
       break;    
     case BeaconMode::armed:
-    beacon.setPixelColor(0, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(1, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(2, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(3, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(4, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(5, beacon.Color(255, 239, 0, 0));
-    beacon.setPixelColor(6, beacon.Color(255, 239, 0, 0));
-    obled.setPixelColor(0, obled.Color(255,239,0));    
-      beaconStrobeSpeed = 500;  
+    leds[0] = CRGB::Yellow;
+    leds[1] = CRGB::Yellow;
+    leds[2] = CRGB::Yellow;
+    leds[3] = CRGB::Yellow;
+    leds[4] = CRGB::Yellow;
+    leds[5] = CRGB::Yellow;
+    leds[6] = CRGB::Yellow;    
+      beaconStrobeSpeed = 800;  
       break;    
     case BeaconMode::interlock:
-    beacon.setPixelColor(0, beacon.Color(255, 0, 0, 0));
-    beacon.setPixelColor(1, beacon.Color(255, 0, 0, 0));
-    beacon.setPixelColor(2, beacon.Color(255, 0, 0, 0));
-    beacon.setPixelColor(3, beacon.Color(255, 0, 0, 0));
-    beacon.setPixelColor(4, beacon.Color(255, 0, 0, 0));
-    beacon.setPixelColor(5, beacon.Color(255, 0, 0, 0));
-    beacon.setPixelColor(6, beacon.Color(255, 0, 0, 0));  
-    obled.setPixelColor(0, obled.Color(255,0,0));
+    leds[0] = CRGB::Red;
+    leds[1] = CRGB::Red;
+    leds[2] = CRGB::Red;
+    leds[3] = CRGB::Red;
+    leds[4] = CRGB::Red;
+    leds[5] = CRGB::Red;
+    leds[6] = CRGB::Red;    
       beaconStrobeSpeed = 2500;  
       break;    
     default:
-    beacon.setPixelColor(0, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(1, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(2, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(3, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(4, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(5, beacon.Color(0, 0, 0, 0));
-    beacon.setPixelColor(6, beacon.Color(0, 0, 0, 0));
-    obled.setPixelColor(0, obled.Color(0,0,0));
+    leds[0] = CRGB::Black;
+    leds[1] = CRGB::Black;
+    leds[2] = CRGB::Black;
+    leds[3] = CRGB::Black;
+    leds[4] = CRGB::Black;
+    leds[5] = CRGB::Black;
+    leds[6] = CRGB::Black;    
       beaconStrobeSpeed = 1000;  
       break;
     }    
   }
 
-  beacon.show();  
-  obled.show();
+  FastLED.show();  
+  
+
+  
 }
 
 void updateBeacon() {  
   if ((millis() >= lastBeaconEvent + (beaconStrobeSpeed/2)) && beaconState == false) {    
-    beaconEvent();
+    beaconEvent();    
     lastBeaconEvent = millis();
   } else if ((millis() >= lastBeaconEvent + beaconStrobeSpeed) && beaconState == true) {
-    beaconEvent();
+    beaconEvent();    
     lastBeaconEvent = millis();
   }
 }
 
-void setBeacon(BeaconMode newMode) {
-      beaconMode = newMode;
-      updateBeacon();
+void setBeacon(BeaconMode newMode) {  
+  if (beaconMode != newMode) {    
+      beaconMode = newMode;      
+      beaconEvent();    
+  }    
 }
+
+
+void canBusCallback(const ISOTP_data &config, const uint8_t *buf) {
+ 
+  int len = config.len-1;
+  String parsedString;
+  for(int i=0; i<len; i++)
+  {
+    String byte = (char)buf[i];    
+    parsedString += byte;
+  }
+
+  std::vector<String> fields = split(parsedString,",");
+  
+  if (fields[0] <= MIN_DISTANCE_STOP || fields[1] <= MIN_DISTANCE_STOP || fields[2] <= MIN_DISTANCE_STOP ) {        
+    if (beaconMode != BeaconMode::interlock) {      
+      stopAll();
+      setBeacon(BeaconMode::interlock);                          
+      Serial.println("[canBusCallback] Minimum Distance Reached");
+    }
+  }
+  
+  // Serial.println(newString);
+
+}
+
+// void canBusCallback(const ISOTP_data &config, const uint8_t *buf) {
+
+//   Serial.println(buf[0]);
+//   Serial.println(buf[1]);
+//   Serial.println(buf[2]);
+
+
+//   int len = config.len-1;
+//   String newString;
+//   for(int i=0; i<len; i++)
+//   {
+//     String byte = (char)buf[i];    
+//     newString = newString + byte;
+//   }
+//   Serial.println(newString);
+
+// }
+
+
+
+
+// /////
+// #include <FlexCAN_T4.h>
+// #include <isotp.h>
+// isotp<RX_BANKS_16, 512> tp; /* 16 slots for multi-ID support, at 512bytes buffer each payload rebuild */
+// FlexCAN_T4<CAN1, RX_SIZE_256, TX_SIZE_16> Can1;
+
+// void myCallback(const ISOTP_data &config, const uint8_t *buf) {
+
+// Serial.println(buf[0]);
+// Serial.println(buf[1]);
+// Serial.println(buf[2]);
+
+
+// int len = config.len-1;
+// String newString;
+// for(int i=0; i<len; i++)
+// {
+//     String byte = (char)buf[i];    
+//     newString = newString + byte;
+// }
+// Serial.println(newString);
+
+// }
+
+
+// void setup() {
+//   Serial.begin(115200); delay(400);
+//   Can1.begin();
+//   Can1.setClock(CLK_60MHz);
+//   Can1.setBaudRate(95238);
+//   Can1.setMaxMB(16);
+//   Can1.enableFIFO();
+//   Can1.enableFIFOInterrupt();
+//   tp.begin();
+//   tp.setWriteBus(&Can1); /* we write to this bus */
+//   tp.onReceive(myCallback); /* set callback */
+
+//   pinMode(3, OUTPUT);
+//   pinMode(4, OUTPUT);
+
+// }
+
+// void loop() {
+//   static uint32_t sendTimer = millis();
+//   if ( millis() - sendTimer > 1000 ) {
+//     uint8_t buf[] = {100, 200, 255};
+//     ISOTP_data config;
+//     config.id = 0x666;
+//     config.flags.extended = 0; /* standard frame */
+//     config.separation_time = 10; /* time between back-to-back frames in millisec */
+//     tp.write(config, buf, sizeof(buf));
+//     // tp.write(config, b, sizeof(b));
+//     sendTimer = millis();
+
+    
+
+
+//   }
